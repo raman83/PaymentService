@@ -2,10 +2,15 @@ package com.payment.service;
 
 import com.common.iso.CanonicalPayment;
 import com.payment.client.AccountClient;
+import com.payment.client.TransactionClient;
 import com.payment.dto.PaymentRequest;
+import com.payment.dto.PaymentStatus;
+import com.payment.event.BillPaymentBatchReadyEvent;
 import com.payment.event.PaymentBatchReadyEvent;
+import com.payment.mapper.PaymentMapper;
 import com.payment.model.CanonicalPaymentEntity;
 import com.payment.repository.PaymentRepository;
+import com.transaction.dto.TransactionRequest;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,7 +19,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
-import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -26,107 +31,107 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final AccountClient accountClient;
+    private final TransactionClient transactionClient;
+    private final PaymentMapper mapper;
 
     private static final String ACH_TOPIC = "payment.batch.ready";
     private static final String RTR_TOPIC = "rtr.payment.requested";
+    private static final String BILL_BATCH_READY_TOPIC = "bill.payment.batch.ready";
+
 
     public void processPayment(PaymentRequest request) {
-        // 1. Debit source account
+        CanonicalPayment payment = mapper.toCanonical(request);
+
         accountClient.debitAccount(request.getDebtorAccount(), request.getAmount());
-        log.info("Debited {} from account {}", request.getAmount(), request.getDebtorAccount());
+        postTransaction(payment);
 
-        // 2. Map to Canonical DTO
-        CanonicalPayment paymentDto = mapToCanonicalPayment(request);
-
-        // 3. Persist CanonicalPaymentEntity
-        CanonicalPaymentEntity entity = mapToEntity(paymentDto);
+        CanonicalPaymentEntity entity = mapper.toEntity(payment);
+        entity.setTimestamp(Instant.now());
+        entity.setStatus(PaymentStatus.PENDING);
+        entity.setIncludedInAch(false);
         paymentRepository.save(entity);
 
-        // 4. Handle based on payment channel
-        switch (paymentDto.getChannel()) {
-            case "RTR" -> handleRTR(paymentDto);
-            case "ACH" -> handleACHBatching(entity);
-            default -> log.warn("Unsupported payment channel: {}", paymentDto.getChannel());
+        switch (request.getChannel()) {
+            case AFT -> handleAftBatching();
+            case RTR -> kafkaTemplate.send(RTR_TOPIC, payment);
+            case BILL -> handleBillBatching();
+            case INTERNAL -> handleInternalTransfer(payment);
         }
     }
 
-    private CanonicalPayment mapToCanonicalPayment(PaymentRequest request) {
-        return CanonicalPayment.builder()
-                .paymentId(UUID.randomUUID().toString())
-                .debtorName(request.getDebtorName())
-                .debtorAccount(request.getDebtorAccount())
-                .creditorName(request.getCreditorName())
-                .creditorAccount(request.getCreditorAccount())
-                .creditorBank(request.getCreditorBank())
-                .amount(request.getAmount())
-                .currency(request.getCurrency())
-                .purpose(request.getPurpose())
-                .requestedExecutionDate(LocalDate.now())
-                .channel(request.getChannel()) // "ACH" or "RTR"
-                .proxyType(request.getProxyType())       // null for ACH
-                .proxyValue(request.getProxyValue())     // null for ACH
+    private void postTransaction(CanonicalPayment payment) {
+        TransactionRequest txn = TransactionRequest.builder()
+                .transactionId(UUID.randomUUID())
+                .accountId(UUID.fromString(payment.getDebtorAccount()))
+                .type("DEBIT")
+                .amount(payment.getAmount())
+                .currency(payment.getCurrency())
+                .postedDate(OffsetDateTime.now())
+                .transactionDate(OffsetDateTime.now())
+                .status("POSTED")
+                .description("Payment to " + payment.getCreditorAccount())
                 .build();
+        transactionClient.create(txn);
     }
 
-    private void handleRTR(CanonicalPayment payment) {
-        kafkaTemplate.send(RTR_TOPIC, payment);
-        log.info("Published RTR payment {} to RTR topic", payment.getPaymentId());
+    private void handleInternalTransfer(CanonicalPayment payment) {
+        // Optional business logic for internal transfers
+        log.info("Processed internal transfer: {}", payment.getPaymentId());
     }
 
-    private void handleACHBatching(CanonicalPaymentEntity entity) {
-        List<CanonicalPaymentEntity> pending = paymentRepository
-                .findTop20ByIncludedInAchFalseOrderByTimestampAsc();
+    private void handleAftBatching() {
+        List<CanonicalPaymentEntity> pending = paymentRepository.findTop20ByIncludedInAchFalseOrderByTimestampAsc();
 
         if (pending.size() == 20) {
             pending.forEach(p -> p.setIncludedInAch(true));
             paymentRepository.saveAll(pending);
 
             List<CanonicalPayment> canonicalPayments = pending.stream()
-                    .map(this::mapEntityToDto)
+                    .map(mapper::toDto)
                     .toList();
 
             PaymentBatchReadyEvent event = new PaymentBatchReadyEvent(
-                    UUID.randomUUID().toString(),
+                    UUID.randomUUID(),
                     Instant.now().toString(),
                     canonicalPayments
             );
 
             kafkaTemplate.send(ACH_TOPIC, event);
-            log.info("Published batch of 20 canonical payments to Kafka");
         }
     }
+    
+    
+    private void handleBillBatching() {
+    	 List<CanonicalPaymentEntity> pending = paymentRepository
+    		        .findTop20ByChannelAndIncludedInBillBatchFalseOrderByTimestampAsc("BILL");
 
-    private CanonicalPaymentEntity mapToEntity(CanonicalPayment dto) {
-        CanonicalPaymentEntity entity = new CanonicalPaymentEntity();
-        entity.setPaymentId(dto.getPaymentId());
-        entity.setDebtorName(dto.getDebtorName());
-        entity.setDebtorAccount(dto.getDebtorAccount());
-        entity.setCreditorName(dto.getCreditorName());
-        entity.setCreditorAccount(dto.getCreditorAccount());
-        entity.setCreditorBank(dto.getCreditorBank());
-        entity.setAmount(dto.getAmount());
-        entity.setCurrency(dto.getCurrency());
-        entity.setPurpose(dto.getPurpose());
-        entity.setRequestedExecutionDate(dto.getRequestedExecutionDate());
-        entity.setChannel(dto.getChannel());
-        entity.setTimestamp(Instant.now());
-        entity.setIncludedInAch(false);
-        return entity;
+        if (pending.size() == 20) {
+            pending.forEach(p -> p.setIncludedInBillBatch(true));
+            paymentRepository.saveAll(pending);
+
+            List<CanonicalPayment> canonicalPayments = pending.stream()
+                    .map(mapper::toDto)
+                    .toList();
+
+            BillPaymentBatchReadyEvent event = new BillPaymentBatchReadyEvent(
+                    UUID.randomUUID(),
+                    Instant.now().toString(),
+                    canonicalPayments
+            );
+
+            kafkaTemplate.send(BILL_BATCH_READY_TOPIC, event);
+        }
     }
+    
+    
+    public void updateStatus(UUID paymentId, String status, String reason) {
+        CanonicalPaymentEntity entity = paymentRepository.findByPaymentId(paymentId)
+            .orElseThrow(() -> new RuntimeException("Payment not found"));
 
-    private CanonicalPayment mapEntityToDto(CanonicalPaymentEntity entity) {
-        return CanonicalPayment.builder()
-                .paymentId(entity.getPaymentId())
-                .debtorName(entity.getDebtorName())
-                .debtorAccount(entity.getDebtorAccount())
-                .creditorName(entity.getCreditorName())
-                .creditorAccount(entity.getCreditorAccount())
-                .creditorBank(entity.getCreditorBank())
-                .amount(entity.getAmount())
-                .currency(entity.getCurrency())
-                .purpose(entity.getPurpose())
-                .requestedExecutionDate(entity.getRequestedExecutionDate())
-                .channel(entity.getChannel())
-                .build();
+        entity.setStatus(PaymentStatus.valueOf(status));
+        entity.setAckReceivedAt(Instant.now());
+
+   
+        paymentRepository.save(entity);
     }
 }

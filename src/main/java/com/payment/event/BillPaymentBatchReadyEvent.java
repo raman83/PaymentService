@@ -14,8 +14,8 @@ import com.common.iso.CanonicalPayment;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class PaymentBatchReadyEvent {
+public class BillPaymentBatchReadyEvent {
     private UUID batchId;
-    private String createdAt;
+    private String triggerTime;
     private List<CanonicalPayment> payments;
 }

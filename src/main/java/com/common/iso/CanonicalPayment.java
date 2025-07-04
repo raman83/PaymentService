@@ -7,13 +7,14 @@ import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.util.UUID;
 
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder  
 public class CanonicalPayment {
-    private String paymentId;
+    private UUID paymentId;
     private String debtorName;
     private String debtorAccount;
     private String creditorName;
@@ -31,4 +32,10 @@ public class CanonicalPayment {
     private String proxyValue;
     private String rtrStatus;      // PENDING, ACCEPTED, REJECTED
     private String rtrReasonCode;  // e.g. LIMIT_EXCEEDED, INVALID_PROXY
+    
+    
+    
+    // ✅ BILL-specific (optional)
+    private String billerName;
+    private String billReferenceNumber;
 }
