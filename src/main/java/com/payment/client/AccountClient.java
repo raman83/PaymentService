@@ -9,9 +9,9 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
-@FeignClient(name = "account-service", url = "http://localhost:8084/api/v1")
+@FeignClient(name = "account-service", url = "${account.service.url}")
 public interface AccountClient {
-	@PostMapping("/accounts/{id}/debit")
+	@PostMapping("/api/v1/accounts/{id}/debit")
     public ResponseEntity<Void> debitAccount(
             @PathVariable("id") String id,
             @RequestParam("amount") BigDecimal amount);
