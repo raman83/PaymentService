@@ -1,6 +1,8 @@
 package com.payment.controller;
 
+import com.payment.dto.BillerRequest;
 import com.payment.dto.PaymentRequest;
+import com.payment.service.BillerService;
 import com.payment.service.PaymentService;
 import lombok.RequiredArgsConstructor;
 
@@ -15,10 +17,19 @@ import org.springframework.web.bind.annotation.*;
 public class PaymentController {
 
     private final PaymentService paymentService;
+    private final BillerService billerService;
+
 
     @PostMapping
     public ResponseEntity<Void> makePayment(@RequestBody PaymentRequest request) {
         paymentService.processPayment(request);
+        return ResponseEntity.ok().build();
+    }
+    
+    
+    @PostMapping("/billers")
+    public ResponseEntity<Void> addBiller(@RequestBody BillerRequest request) {
+        billerService.addBiller(request);
         return ResponseEntity.ok().build();
     }
     
