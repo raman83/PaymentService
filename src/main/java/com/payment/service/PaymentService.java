@@ -1,3 +1,4 @@
+// PaymentService.java (updated)
 package com.payment.service;
 
 import com.common.iso.CanonicalPayment;
@@ -14,7 +15,6 @@ import com.transaction.dto.TransactionRequest;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -38,13 +38,16 @@ public class PaymentService {
     private static final String RTR_TOPIC = "rtr.payment.requested";
     private static final String BILL_BATCH_READY_TOPIC = "bill.payment.batch.ready";
 
-
     public void processPayment(PaymentRequest request) {
         CanonicalPayment payment = mapper.toCanonical(request);
 
+        // Debit source account
         accountClient.debitAccount(request.getDebtorAccount(), request.getAmount());
+
+        // Log transaction
         postTransaction(payment);
 
+        // Persist canonical record
         CanonicalPaymentEntity entity = mapper.toEntity(payment);
         entity.setTimestamp(Instant.now());
         entity.setStatus(PaymentStatus.PENDING);
@@ -74,9 +77,32 @@ public class PaymentService {
         transactionClient.create(txn);
     }
 
+    private void postCreditTransaction(CanonicalPayment payment) {
+        TransactionRequest txn = TransactionRequest.builder()
+                .transactionId(UUID.randomUUID())
+                .accountId(UUID.fromString(payment.getCreditorAccount()))
+                .type("CREDIT")
+                .amount(payment.getAmount())
+                .currency(payment.getCurrency())
+                .postedDate(OffsetDateTime.now())
+                .transactionDate(OffsetDateTime.now())
+                .status("POSTED")
+                .description("Received from " + payment.getDebtorAccount())
+                .build();
+        transactionClient.create(txn);
+    }
+
     private void handleInternalTransfer(CanonicalPayment payment) {
-        // Optional business logic for internal transfers
-        log.info("Processed internal transfer: {}", payment.getPaymentId());
+        log.info("🔄 Performing internal transfer between {} and {}", payment.getDebtorAccount(), payment.getCreditorAccount());
+
+        // Credit recipient account
+        accountClient.creditAccount(payment.getCreditorAccount(), payment.getAmount());
+        postCreditTransaction(payment);
+
+        CanonicalPaymentEntity entity = mapper.toEntity(payment);
+        entity.setTimestamp(Instant.now());
+        entity.setStatus(PaymentStatus.PROCESSED);
+        paymentRepository.save(entity);
     }
 
     private void handleAftBatching() {
@@ -99,11 +125,10 @@ public class PaymentService {
             kafkaTemplate.send(ACH_TOPIC, event);
         }
     }
-    
-    
+
     private void handleBillBatching() {
-    	 List<CanonicalPaymentEntity> pending = paymentRepository
-    		        .findTop20ByChannelAndIncludedInBillBatchFalseOrderByTimestampAsc("BILL");
+        List<CanonicalPaymentEntity> pending = paymentRepository
+                .findTop20ByChannelAndIncludedInBillBatchFalseOrderByTimestampAsc("BILL");
 
         if (pending.size() == 20) {
             pending.forEach(p -> p.setIncludedInBillBatch(true));
@@ -122,16 +147,13 @@ public class PaymentService {
             kafkaTemplate.send(BILL_BATCH_READY_TOPIC, event);
         }
     }
-    
-    
+
     public void updateStatus(UUID paymentId, String status, String reason) {
         CanonicalPaymentEntity entity = paymentRepository.findByPaymentId(paymentId)
-            .orElseThrow(() -> new RuntimeException("Payment not found"));
+                .orElseThrow(() -> new RuntimeException("Payment not found"));
 
         entity.setStatus(PaymentStatus.valueOf(status));
         entity.setAckReceivedAt(Instant.now());
-
-   
         paymentRepository.save(entity);
     }
 }
