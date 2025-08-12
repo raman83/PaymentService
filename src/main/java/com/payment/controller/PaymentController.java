@@ -35,7 +35,7 @@ public class PaymentController {
     
     
     
-    @PutMapping("/payments/{paymentId}/status")
+    @PutMapping("/{paymentId}/status")
     public ResponseEntity<Void> updatePaymentStatus(
         @PathVariable UUID paymentId,
         @RequestParam String status,

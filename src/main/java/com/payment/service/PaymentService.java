@@ -1,9 +1,13 @@
 // PaymentService.java (updated)
 package com.payment.service;
 
+import com.authuser.dto.LoginResponse;
+import com.authuser.dto.TokenRequest;
 import com.common.iso.CanonicalPayment;
 import com.payment.client.AccountClient;
+import com.payment.client.AuthClient;
 import com.payment.client.TransactionClient;
+import com.payment.dto.PaymentChannel;
 import com.payment.dto.PaymentRequest;
 import com.payment.dto.PaymentStatus;
 import com.payment.event.BillPaymentBatchReadyEvent;
@@ -31,6 +35,7 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final AccountClient accountClient;
+    private final AuthClient authClient;
     private final TransactionClient transactionClient;
     private final PaymentMapper mapper;
 
@@ -42,7 +47,7 @@ public class PaymentService {
         CanonicalPayment payment = mapper.toCanonical(request);
 
         // Debit source account
-        accountClient.debitAccount(request.getDebtorAccount(), request.getAmount());
+        accountClient.debitAccount(UUID.fromString(request.getDebtorAccount()), request.getAmount());
 
         // Log transaction
         postTransaction(payment);
@@ -51,8 +56,12 @@ public class PaymentService {
         CanonicalPaymentEntity entity = mapper.toEntity(payment);
         entity.setTimestamp(Instant.now());
         entity.setStatus(PaymentStatus.PENDING);
-        entity.setIncludedInAch(false);
+        entity.setIncludedInAch(request.getChannel() == PaymentChannel.AFT ? false : null);
+        entity.setIncludedInBillBatch(request.getChannel() == PaymentChannel.BILL ? false : null);
+        
         paymentRepository.save(entity);
+        
+        payment.setPaymentId(entity.getPaymentId());
 
         switch (request.getChannel()) {
             case AFT -> handleAftBatching();
@@ -74,7 +83,7 @@ public class PaymentService {
                 .status("POSTED")
                 .description("Payment to " + payment.getCreditorAccount())
                 .build();
-        transactionClient.create(txn);
+        transactionClient.createTransaction(txn,null);
     }
 
     private void postCreditTransaction(CanonicalPayment payment) {
@@ -89,14 +98,14 @@ public class PaymentService {
                 .status("POSTED")
                 .description("Received from " + payment.getDebtorAccount())
                 .build();
-        transactionClient.create(txn);
+        transactionClient.createTransaction(txn,null);
     }
 
     private void handleInternalTransfer(CanonicalPayment payment) {
         log.info("🔄 Performing internal transfer between {} and {}", payment.getDebtorAccount(), payment.getCreditorAccount());
 
         // Credit recipient account
-        accountClient.creditAccount(payment.getCreditorAccount(), payment.getAmount());
+        accountClient.creditAccount(UUID.fromString(payment.getCreditorAccount()), payment.getAmount(),null);
         postCreditTransaction(payment);
 
         CanonicalPaymentEntity entity = mapper.toEntity(payment);
@@ -106,7 +115,8 @@ public class PaymentService {
     }
 
     private void handleAftBatching() {
-        List<CanonicalPaymentEntity> pending = paymentRepository.findTop20ByIncludedInAchFalseOrderByTimestampAsc();
+        List<CanonicalPaymentEntity> pending =     paymentRepository.findTop20ByChannelAndIncludedInAchFalseOrderByTimestampAsc("AFT");
+
 
         if (pending.size() == 20) {
             pending.forEach(p -> p.setIncludedInAch(true));
@@ -127,8 +137,8 @@ public class PaymentService {
     }
 
     private void handleBillBatching() {
-        List<CanonicalPaymentEntity> pending = paymentRepository
-                .findTop20ByChannelAndIncludedInBillBatchFalseOrderByTimestampAsc("BILL");
+        List<CanonicalPaymentEntity> pending =     paymentRepository.findTop20ByChannelAndIncludedInBillBatchFalseOrderByTimestampAsc("BILL");
+
 
         if (pending.size() == 20) {
             pending.forEach(p -> p.setIncludedInBillBatch(true));
@@ -155,5 +165,34 @@ public class PaymentService {
         entity.setStatus(PaymentStatus.valueOf(status));
         entity.setAckReceivedAt(Instant.now());
         paymentRepository.save(entity);
+        
+        TokenRequest request = new TokenRequest();
+        request.setClientId("COElk9GHOmWS9L4MAQvscuxA49Cl4mfI");
+        request.setClientSecret("zTgcKt-3ZgIik7q6SlVnv_abzfTzD91CBmtJq2jIFXDLBcRy4yYD-du3En2rJXWI");        
+   
+        
+        String token = authClient.token(request).getBody().getAccessToken();        
+        
+        // Compensation on failure
+        if (PaymentStatus.valueOf(status) == PaymentStatus.FAILED) {
+            // Auto-credit back
+            accountClient.creditAccount(UUID.fromString(entity.getDebtorAccount()), entity.getAmount(),"Bearer " + token);
+            // Post reversal txn
+            transactionClient.createTransaction(TransactionRequest.builder()
+                .transactionId(UUID.randomUUID())
+                .accountId(UUID.fromString(entity.getDebtorAccount()))
+                .type("CREDIT")
+                .amount(entity.getAmount())
+                .currency(entity.getCurrency())
+                .postedDate(OffsetDateTime.now())
+                .transactionDate(OffsetDateTime.now())
+                .status("POSTED")
+                .description("Reversal for failed payment " + paymentId)
+                .build(), "Bearer " + token);
+        }
+        
+        
+        
+        
     }
 }

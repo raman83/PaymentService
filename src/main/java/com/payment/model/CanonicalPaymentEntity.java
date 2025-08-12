@@ -38,7 +38,11 @@ public class CanonicalPaymentEntity {
     @Column(nullable = false)
     private Instant timestamp;
     
+    @Column(nullable = true)
+
     private Boolean includedInAch;
-    private boolean includedInBillBatch;
+    @Column(nullable = true)
+
+    private Boolean includedInBillBatch;
 
 }

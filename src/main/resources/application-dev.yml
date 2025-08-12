@@ -40,3 +40,8 @@ account:
 transaction:
   service:
     url: http://localhost:8091
+    
+    
+authuser:
+  service:
+     url: http://localhost:8094
