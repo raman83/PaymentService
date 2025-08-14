@@ -14,15 +14,17 @@ import java.util.UUID;
 @AllArgsConstructor
 @Builder  
 public class CanonicalPayment {
-    private UUID paymentId;
-    private String debtorName;
+	private UUID paymentId;
     private String debtorAccount;
+
     private String creditorName;
-    private String creditorAccount;
-    private String creditorBank;
-    private BigDecimal amount;
+    private String creditorAccount;           // external account number (if AFT)
+    private String creditorInstitutionNumber; // NEW
+    private String creditorTransitNumber;     // NEW
     private String currency;
     private String purpose;
+
+    private BigDecimal amount;
     private LocalDate requestedExecutionDate;
     private String channel; // ACH, RTR, SWIFT, etc.
     

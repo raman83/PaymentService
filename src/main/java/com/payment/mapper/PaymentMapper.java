@@ -12,7 +12,7 @@ import org.mapstruct.*;
 @Mapper(componentModel = "spring")
 public interface PaymentMapper {
 
-    @Mapping(target = "paymentId", ignore = true)
+	@Mapping(target = "paymentId", ignore = true)
     @Mapping(target = "requestedExecutionDate", ignore = true)
     @Mapping(target = "rtrStatus", ignore = true)
     @Mapping(target = "rtrReasonCode", ignore = true)
@@ -23,34 +23,34 @@ public interface PaymentMapper {
     CanonicalPayment toDto(CanonicalPaymentEntity entity);
 
     @AfterMapping
-    default void enrich(@MappingTarget CanonicalPayment payment, PaymentRequest request) {
-        payment.setPaymentId(UUID.randomUUID());
+    default void enrich(@MappingTarget CanonicalPayment p, PaymentRequest req) {
+    	 p.setPaymentId(UUID.randomUUID());
+         if (p.getRequestedExecutionDate() == null) {
+             p.setRequestedExecutionDate(LocalDate.now());
+         }
 
+         // INTERNAL ⇒ beneficiary ko creditorAccount me set kar do (UUID string)
+         if (req.getChannel() == PaymentChannel.INTERNAL) {
+             if (req.getBeneficiaryAccountId() == null) {
+                 throw new IllegalArgumentException("beneficiaryAccountId is required for INTERNAL transfers");
+             }
+             p.setCreditorAccount(req.getBeneficiaryAccountId().toString());
+         }
 
-        if (payment.getRequestedExecutionDate() == null) {
-            payment.setRequestedExecutionDate(LocalDate.now());
-        }
-     
+         if (req.getChannel() == PaymentChannel.RTR) {
+             p.setRtrStatus("PENDING");
+             p.setRtrReasonCode(null);
+         }
 
-        if (request.getChannel() == PaymentChannel.RTR) {
-            payment.setRtrStatus("PENDING");
-            payment.setRtrReasonCode(null);
-        }
-
-        if (request.getChannel() == PaymentChannel.BILL && request.getBillerName() != null) {
-            payment.setCreditorName(request.getBillerName());
-        }
-        
-        if (request.getChannel() == PaymentChannel.BILL) {
-            // ✅ BILL enrichment
-            if (request.getBillerName() != null) {
-                payment.setBillerName(request.getBillerName());
-                payment.setCreditorName(request.getBillerName()); // Overriding
-            }
-            if (request.getBillReferenceNumber() != null) {
-                payment.setBillReferenceNumber(request.getBillReferenceNumber());
-            }
-        }
+         if (req.getChannel() == PaymentChannel.BILL) {
+             if (req.getBillerName() != null) {
+                 p.setBillerName(req.getBillerName());
+                 p.setCreditorName(req.getBillerName());
+             }
+             if (req.getBillReferenceNumber() != null) {
+                 p.setBillReferenceNumber(req.getBillReferenceNumber());
+             }
+         }
         
     }
 }

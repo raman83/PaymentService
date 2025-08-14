@@ -13,7 +13,7 @@ import com.payment.dto.PaymentStatus;
 import com.payment.event.BillPaymentBatchReadyEvent;
 import com.payment.event.PaymentBatchReadyEvent;
 import com.payment.mapper.PaymentMapper;
-import com.payment.model.CanonicalPaymentEntity;
+import com.payment.model.*;
 import com.payment.repository.PaymentRepository;
 import com.transaction.dto.TransactionRequest;
 
@@ -38,6 +38,7 @@ public class PaymentService {
     private final AuthClient authClient;
     private final TransactionClient transactionClient;
     private final PaymentMapper mapper;
+    private final CounterpartyService counterpartyService;
 
     private static final String ACH_TOPIC = "payment.batch.ready";
     private static final String RTR_TOPIC = "rtr.payment.requested";
@@ -45,6 +46,26 @@ public class PaymentService {
 
     public void processPayment(PaymentRequest request) {
         CanonicalPayment payment = mapper.toCanonical(request);
+        
+        
+        if (request.getCounterpartyId() != null) {
+            var cp = counterpartyService.get(request.getCounterpartyId());
+            if (cp.getStatus() != ExternalCounterparty.Status.VERIFIED)
+                throw new IllegalStateException("Counterparty not verified");
+
+            payment.setCreditorName(
+                cp.getHolderName() != null ? cp.getHolderName() : cp.getNickname()
+            );
+            payment.setCreditorAccount(cp.getAccountNumber());
+            payment.setCreditorInstitutionNumber(cp.getInstitutionNumber());
+            payment.setCreditorTransitNumber(cp.getTransitNumber());
+
+            // If user chose channel=null, use cp.preferredRail as default
+            if (request.getChannel() == null && cp.getPreferredRail() != null) {
+                request.setChannel(PaymentChannel.valueOf(cp.getPreferredRail().name()));
+            }
+        }
+
 
         // Debit source account
         accountClient.debitAccount(UUID.fromString(request.getDebtorAccount()), request.getAmount());
@@ -65,7 +86,24 @@ public class PaymentService {
 
         switch (request.getChannel()) {
             case AFT -> handleAftBatching();
-            case RTR -> kafkaTemplate.send(RTR_TOPIC, payment);
+            case RTR -> {
+            	 // guards
+                if (request.getCounterpartyId() != null) {
+                    var cp = counterpartyService.get(request.getCounterpartyId());
+                    if (!cp.isSupportsRtr()) throw new IllegalStateException("Counterparty not RTR-enabled");
+                } else if (payment.getProxyType() == null || payment.getProxyValue() == null) {
+                    throw new IllegalArgumentException("RTR needs counterparty with RTR or proxyType+proxyValue");
+                }
+                
+             // normalize PHONE/EMAIL proxy
+                String normalized = com.payment.util.ProxyUtils.normalizeProxy(payment.getProxyType(), payment.getProxyValue());
+                payment.setProxyValue(normalized);
+                payment.setRtrStatus("PENDING");
+                payment.setRtrReasonCode(null);
+
+                kafkaTemplate.send("rtr.payment.requested", payment);
+                
+                }
             case BILL -> handleBillBatching();
             case INTERNAL -> handleInternalTransfer(payment);
         }
@@ -108,9 +146,11 @@ public class PaymentService {
         accountClient.creditAccount(UUID.fromString(payment.getCreditorAccount()), payment.getAmount(),null);
         postCreditTransaction(payment);
 
-        CanonicalPaymentEntity entity = mapper.toEntity(payment);
-        entity.setTimestamp(Instant.now());
-        entity.setStatus(PaymentStatus.PROCESSED);
+     // 2) mark existing row PROCESSED/SETTLED (no duplicate insert)
+        CanonicalPaymentEntity entity = paymentRepository.findByPaymentId(payment.getPaymentId())
+            .orElseThrow(() -> new RuntimeException("Payment not found"));
+        entity.setStatus(PaymentStatus.SETTLED);       // or PROCESSED if you prefer
+        entity.setAckReceivedAt(Instant.now());
         paymentRepository.save(entity);
     }
 
