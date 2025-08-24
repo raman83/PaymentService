@@ -2,10 +2,12 @@ package com.payment.controller;
 
 import com.payment.dto.BillerRequest;
 import com.payment.dto.PaymentRequest;
+import com.payment.dto.PaymentResponse;
 import com.payment.service.BillerService;
 import com.payment.service.PaymentService;
 import lombok.RequiredArgsConstructor;
 
+import java.net.URI;
 import java.util.UUID;
 
 import org.springframework.http.ResponseEntity;
@@ -21,9 +23,11 @@ public class PaymentController {
 
 
     @PostMapping
-    public ResponseEntity<Void> makePayment(@RequestBody PaymentRequest request) {
-        paymentService.processPayment(request);
-        return ResponseEntity.ok().build();
+    public ResponseEntity<PaymentResponse> makePayment(@RequestBody PaymentRequest request) {
+    	PaymentResponse res=   paymentService.processPayment(request);
+  	  URI loc = URI.create("/api/v1/payments");
+
+        return ResponseEntity.created(loc).body(res);
     }
     
     

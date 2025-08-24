@@ -1,14 +1,15 @@
-// PaymentService.java (updated)
 package com.payment.service;
 
-import com.authuser.dto.LoginResponse;
 import com.authuser.dto.TokenRequest;
 import com.common.iso.CanonicalPayment;
 import com.payment.client.AccountClient;
 import com.payment.client.AuthClient;
 import com.payment.client.TransactionClient;
+import com.payment.client.dto.AccountResponse;           // for ETag access
+import com.payment.client.dto.PostingRequest;           // skinny PostingRequest
 import com.payment.dto.PaymentChannel;
 import com.payment.dto.PaymentRequest;
+import com.payment.dto.PaymentResponse;                  // <-- NEW
 import com.payment.dto.PaymentStatus;
 import com.payment.event.BillPaymentBatchReadyEvent;
 import com.payment.event.PaymentBatchReadyEvent;
@@ -19,6 +20,7 @@ import com.transaction.dto.TransactionRequest;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -44,10 +46,11 @@ public class PaymentService {
     private static final String RTR_TOPIC = "rtr.payment.requested";
     private static final String BILL_BATCH_READY_TOPIC = "bill.payment.batch.ready";
 
-    public void processPayment(PaymentRequest request) {
+    /** Now returns PaymentResponse (everything else unchanged) */
+    public PaymentResponse processPayment(PaymentRequest request) {
         CanonicalPayment payment = mapper.toCanonical(request);
-        
-        
+
+        // ---- Counterparty enrichment (unchanged) ----
         if (request.getCounterpartyId() != null) {
             var cp = counterpartyService.get(request.getCounterpartyId());
             if (cp.getStatus() != ExternalCounterparty.Status.VERIFIED)
@@ -66,47 +69,84 @@ public class PaymentService {
             }
         }
 
+        // ---- DEBIT source account (ETag + PostingRequest) ----
+        UUID debtorAccountId = UUID.fromString(request.getDebtorAccount());
+        String eTagDebtor = fetchEtag(debtorAccountId, null);
+        PostingRequest debitReq = PostingRequest.builder()
+                .amount(request.getAmount())
+                .currency(nz(request.getCurrency(), "CAD"))
+                .description("Payment to " + nz(payment.getCreditorAccount(), "external"))
+                .source("INTERNAL")
+                .createHold(false)
+                .build();
+        accountClient.debit(debtorAccountId, null, eTagDebtor, debitReq);
 
-        // Debit source account
-        accountClient.debitAccount(UUID.fromString(request.getDebtorAccount()), request.getAmount());
-
-        // Log transaction
+        // ---- Log DEBIT transaction (unchanged) ----
         postTransaction(payment);
 
-        // Persist canonical record
+        // ---- Persist canonical record (unchanged) ----
         CanonicalPaymentEntity entity = mapper.toEntity(payment);
         entity.setTimestamp(Instant.now());
         entity.setStatus(PaymentStatus.PENDING);
         entity.setIncludedInAch(request.getChannel() == PaymentChannel.AFT ? false : null);
         entity.setIncludedInBillBatch(request.getChannel() == PaymentChannel.BILL ? false : null);
-        
         paymentRepository.save(entity);
-        
+
         payment.setPaymentId(entity.getPaymentId());
 
-        switch (request.getChannel()) {
-            case AFT -> handleAftBatching();
-            case RTR -> {
-            	 // guards
-                if (request.getCounterpartyId() != null) {
-                    var cp = counterpartyService.get(request.getCounterpartyId());
-                    if (!cp.isSupportsRtr()) throw new IllegalStateException("Counterparty not RTR-enabled");
-                } else if (payment.getProxyType() == null || payment.getProxyValue() == null) {
-                    throw new IllegalArgumentException("RTR needs counterparty with RTR or proxyType+proxyValue");
-                }
-                
-             // normalize PHONE/EMAIL proxy
-                String normalized = com.payment.util.ProxyUtils.normalizeProxy(payment.getProxyType(), payment.getProxyValue());
-                payment.setProxyValue(normalized);
-                payment.setRtrStatus("PENDING");
-                payment.setRtrReasonCode(null);
+        // ---- Channel orchestration (unchanged logic) ----
+        if (request.getChannel() != null) {
+            switch (request.getChannel()) {
+                case AFT -> handleAftBatching();
+                case RTR -> {
+                    // guards
+                    if (request.getCounterpartyId() != null) {
+                        var cp = counterpartyService.get(request.getCounterpartyId());
+                        if (!cp.isSupportsRtr()) throw new IllegalStateException("Counterparty not RTR-enabled");
+                    } else if (payment.getProxyType() == null || payment.getProxyValue() == null) {
+                        throw new IllegalArgumentException("RTR needs counterparty with RTR or proxyType+proxyValue");
+                    }
 
-                kafkaTemplate.send("rtr.payment.requested", payment);
-                
+                    // normalize PHONE/EMAIL proxy
+                    String normalized = com.payment.util.ProxyUtils.normalizeProxy(payment.getProxyType(), payment.getProxyValue());
+                    payment.setProxyValue(normalized);
+                    payment.setRtrStatus("PENDING");
+                    payment.setRtrReasonCode(null);
+
+                    kafkaTemplate.send(RTR_TOPIC, payment);
                 }
-            case BILL -> handleBillBatching();
-            case INTERNAL -> handleInternalTransfer(payment);
+                case BILL -> handleBillBatching();
+                case INTERNAL -> handleInternalTransfer(payment);
+            }
         }
+
+        // Re-read status if INTERNAL may have settled inside handleInternalTransfer
+        CanonicalPaymentEntity latest = paymentRepository.findByPaymentId(payment.getPaymentId())
+                .orElse(entity);
+
+        // Build PaymentResponse (no holds created here; holdId remains null)
+        String toAccount = null;
+        if (request.getChannel() == PaymentChannel.INTERNAL && payment.getCreditorAccount() != null) {
+            toAccount = payment.getCreditorAccount();
+        }
+        if (request.getChannel() == PaymentChannel.BILL && payment.getCreditorAccount() != null) {
+            toAccount = payment.getCreditorAccount();
+        }
+
+        PaymentResponse response = PaymentResponse.builder()
+                .paymentId(latest.getPaymentId())
+                .status(latest.getStatus() != null ? latest.getStatus().name() : null)
+                .fromAccount(debtorAccountId)
+                .toAccount(toAccount)
+                .amount(latest.getAmount())
+                .currency(latest.getCurrency())
+                .channel(request.getChannel() != null ? request.getChannel().name() : null)
+                .direction("OUTBOUND")
+                .holdId(null)
+                .createdAt(latest.getTimestamp())
+                .build();
+
+        return response;
     }
 
     private void postTransaction(CanonicalPayment payment) {
@@ -121,7 +161,7 @@ public class PaymentService {
                 .status("POSTED")
                 .description("Payment to " + payment.getCreditorAccount())
                 .build();
-        transactionClient.createTransaction(txn,null);
+        transactionClient.createTransaction(txn, null);
     }
 
     private void postCreditTransaction(CanonicalPayment payment) {
@@ -136,27 +176,37 @@ public class PaymentService {
                 .status("POSTED")
                 .description("Received from " + payment.getDebtorAccount())
                 .build();
-        transactionClient.createTransaction(txn,null);
+        transactionClient.createTransaction(txn, null);
     }
 
     private void handleInternalTransfer(CanonicalPayment payment) {
         log.info("🔄 Performing internal transfer between {} and {}", payment.getDebtorAccount(), payment.getCreditorAccount());
 
-        // Credit recipient account
-        accountClient.creditAccount(UUID.fromString(payment.getCreditorAccount()), payment.getAmount(),null);
+        // CREDIT recipient account (ETag + PostingRequest, INTERNAL no hold)
+        UUID creditorAccountId = UUID.fromString(payment.getCreditorAccount());
+        String eTagCreditor = fetchEtag(credorOrThrow(creditorAccountId), null);
+        PostingRequest creditReq = PostingRequest.builder()
+                .amount(payment.getAmount())
+                .currency(nz(payment.getCurrency(), "CAD"))
+                .description("Internal transfer credit from " + payment.getDebtorAccount())
+                .source("INTERNAL")
+                .createHold(false)
+                .build();
+        accountClient.credit(creditorAccountId, null, eTagCreditor, creditReq, null);
+        // Log CREDIT transaction
         postCreditTransaction(payment);
 
-     // 2) mark existing row PROCESSED/SETTLED (no duplicate insert)
+        // Mark settled
         CanonicalPaymentEntity entity = paymentRepository.findByPaymentId(payment.getPaymentId())
-            .orElseThrow(() -> new RuntimeException("Payment not found"));
-        entity.setStatus(PaymentStatus.SETTLED);       // or PROCESSED if you prefer
+                .orElseThrow(() -> new RuntimeException("Payment not found"));
+        entity.setStatus(PaymentStatus.SETTLED);
         entity.setAckReceivedAt(Instant.now());
         paymentRepository.save(entity);
     }
 
     private void handleAftBatching() {
-        List<CanonicalPaymentEntity> pending =     paymentRepository.findTop20ByChannelAndIncludedInAchFalseOrderByTimestampAsc("AFT");
-
+        List<CanonicalPaymentEntity> pending =
+                paymentRepository.findTop20ByChannelAndIncludedInAchFalseOrderByTimestampAsc("AFT");
 
         if (pending.size() == 20) {
             pending.forEach(p -> p.setIncludedInAch(true));
@@ -177,8 +227,8 @@ public class PaymentService {
     }
 
     private void handleBillBatching() {
-        List<CanonicalPaymentEntity> pending =     paymentRepository.findTop20ByChannelAndIncludedInBillBatchFalseOrderByTimestampAsc("BILL");
-
+        List<CanonicalPaymentEntity> pending =
+                paymentRepository.findTop20ByChannelAndIncludedInBillBatchFalseOrderByTimestampAsc("BILL");
 
         if (pending.size() == 20) {
             pending.forEach(p -> p.setIncludedInBillBatch(true));
@@ -205,34 +255,59 @@ public class PaymentService {
         entity.setStatus(PaymentStatus.valueOf(status));
         entity.setAckReceivedAt(Instant.now());
         paymentRepository.save(entity);
-        
+
         TokenRequest request = new TokenRequest();
         request.setClientId("COElk9GHOmWS9L4MAQvscuxA49Cl4mfI");
-        request.setClientSecret("zTgcKt-3ZgIik7q6SlVnv_abzfTzD91CBmtJq2jIFXDLBcRy4yYD-du3En2rJXWI");        
-   
-        
-        String token = authClient.token(request).getBody().getAccessToken();        
-        
-        // Compensation on failure
+        request.setClientSecret("zTgcKt-3ZgIik7q6SlVnv_abzfTzD91CBmtJq2jIFXDLBcRy4yYD-du3En2rJXWI");
+
+        String token = authClient.token(request).getBody().getAccessToken();
+
+        // Compensation on failure (preserved) — but use new credit API with If-Match
         if (PaymentStatus.valueOf(status) == PaymentStatus.FAILED) {
-            // Auto-credit back
-            accountClient.creditAccount(UUID.fromString(entity.getDebtorAccount()), entity.getAmount(),"Bearer " + token);
+            UUID debtor = UUID.fromString(entity.getDebtorAccount());
+            String eTag = fetchEtag(debtor,"Bearer " + token );
+            PostingRequest creditBack = PostingRequest.builder()
+                    .amount(entity.getAmount())
+                    .currency(nz(entity.getCurrency(), "CAD"))
+                    .description("Reversal for failed payment " + paymentId)
+                    .source("INTERNAL")
+                    .createHold(false)
+                    .build();
+            accountClient.credit(debtor, null, eTag, creditBack, "Bearer " + token);
+
             // Post reversal txn
             transactionClient.createTransaction(TransactionRequest.builder()
-                .transactionId(UUID.randomUUID())
-                .accountId(UUID.fromString(entity.getDebtorAccount()))
-                .type("CREDIT")
-                .amount(entity.getAmount())
-                .currency(entity.getCurrency())
-                .postedDate(OffsetDateTime.now())
-                .transactionDate(OffsetDateTime.now())
-                .status("POSTED")
-                .description("Reversal for failed payment " + paymentId)
-                .build(), "Bearer " + token);
+                    .transactionId(UUID.randomUUID())
+                    .accountId(debtor)
+                    .type("CREDIT")
+                    .amount(entity.getAmount())
+                    .currency(entity.getCurrency())
+                    .postedDate(OffsetDateTime.now())
+                    .transactionDate(OffsetDateTime.now())
+                    .status("POSTED")
+                    .description("Reversal for failed payment " + paymentId)
+                    .build(), "Bearer " + token);
         }
-        
-        
-        
-        
+    }
+
+    // ---------------- helpers ----------------
+
+    /** Fetch ETag for an account using GET /accounts/{id} */
+    private String fetchEtag(UUID accountId, String token) {
+        ResponseEntity<AccountResponse> resp = accountClient.getAccount(accountId,token);
+        String etag = resp.getHeaders() != null ? resp.getHeaders().getETag() : null;
+        if (etag == null || etag.isBlank()) {
+            throw new IllegalStateException("Missing ETag for account " + accountId);
+        }
+        return etag;
+    }
+
+    private static String nz(String val, String def) {
+        return (val == null || val.isBlank()) ? def : val;
+    }
+
+    private static UUID credorOrThrow(UUID id) {
+        if (id == null) throw new IllegalArgumentException("Creditor account required for INTERNAL");
+        return id;
     }
 }

@@ -11,7 +11,11 @@ import lombok.*;
 @NoArgsConstructor
 @AllArgsConstructor
 public class PaymentRequest {
-	private String debtorAccount;                // hamara (from) account UUID string
+	private String debtorAccount;      // hamara (from) account UUID string
+	private String creditorAccount;                
+    private String creditorBank;
+
+
     private BigDecimal amount;
     private String currency;
     private String purpose;
@@ -31,4 +35,14 @@ public class PaymentRequest {
 
     // --- External ke liye (pehle bataya) ---
     private UUID counterpartyId;     
+    
+    
+    
+ // Optional overrides
+    private Boolean createHold; // force hold regardless of channel rules
+    private Integer holdDays; // e.g., 7
+    private String holdType; // CHEQUE, COMPLIANCE, etc.
+    private String holdReason; 
+    
+    
 }

@@ -39,6 +39,10 @@ public class CanonicalPaymentEntity {
 
     @Column(name = "creditor_account")
     private String creditorAccount; // internal UUID (INTERNAL) ya external acct (AFT)
+    
+    @Column(name = "creditor_bank")
+    private String creditorBank;
+
 
     @Column(name = "creditor_institution_number", length = 3)
     private String creditorInstitutionNumber;

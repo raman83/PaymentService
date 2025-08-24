@@ -19,6 +19,7 @@ public class CanonicalPayment {
 
     private String creditorName;
     private String creditorAccount;           // external account number (if AFT)
+    private String creditorBank;
     private String creditorInstitutionNumber; // NEW
     private String creditorTransitNumber;     // NEW
     private String currency;
