@@ -3,7 +3,10 @@ package com.payment.service;
 
 
 import lombok.RequiredArgsConstructor;
+
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 
 import com.payment.dto.CounterpartyRequest;
 import com.payment.model.ExternalCounterparty;
@@ -15,16 +18,21 @@ import java.util.*;
 public class CounterpartyService {
     private final CounterpartyRepository repo;
 
-    public UUID add(CounterpartyRequest req) {
+    public UUID add(String customerId, CounterpartyRequest req) {
+    	
+    	if (repo.existsByCustomerIdAndAccountNumber(customerId, req.getAccountNumber())) {
+    		throw new ResponseStatusException(HttpStatus.CONFLICT, "Account already exists ");
+    		}
+    	
         ExternalCounterparty cp = ExternalCounterparty.builder()
-                .customerId(req.getCustomerId())
+                .customerId(customerId)
                 .nickname(req.getNickname())
                 .holderName(req.getHolderName())
                 .institutionNumber(req.getInstitutionNumber())
                 .transitNumber(req.getTransitNumber())
                 .accountNumber(req.getAccountNumber())
-                .supportsAft(Boolean.TRUE.equals(req.getSupportsAft()))
-                .supportsRtr(Boolean.TRUE.equals(req.getSupportsRtr()))
+                .supportsAft(Boolean.TRUE.equals(req.getSupportsAft()==null? true: req.getSupportsAft()))
+                .supportsRtr(Boolean.TRUE.equals(req.getSupportsRtr()== null ? true: req.getSupportsRtr()))
                 .preferredRail(req.getPreferredRail() == null ? null :
                         ExternalCounterparty.PreferredRail.valueOf(req.getPreferredRail()))
                 .status(ExternalCounterparty.Status.PENDING_VERIFICATION) // micro-deposits later

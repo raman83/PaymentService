@@ -8,7 +8,7 @@ import org.springframework.context.annotation.Import;
 import com.commons.security.DefaultSecurityConfig;
 import com.commons.security.FeignTokenRelayConfig;
 @Import({DefaultSecurityConfig.class, FeignTokenRelayConfig.class})
-@SpringBootApplication
+@SpringBootApplication(scanBasePackages = {"com.commons", "com.payment"})
 @EnableFeignClients(basePackages = "com.payment.client")
 public class PaymentServiceApplication {
 
